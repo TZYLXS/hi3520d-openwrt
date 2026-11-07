@@ -416,6 +416,54 @@ python3 make_programmer_image.py boot.bin kernel.bin rootfs.jffs2 out/
 
 编程器写 16MB 的 SPI NOR（W25Q128、MX25L12845E 这类）时选整片镜像即可。旧板那颗 `MX25L6406E` 只有 8MB，装不下这个镜像。写完建议先读回比对前 1MB，u-boot 区没有备份机制，写坏了只能再拆一次芯片。
 
+## 附录 E 交给 AI 一键构建
+
+这一节是给"把活丢给会执行命令的 AI"准备的。前提有四条，缺一条都会中途卡住：一台 Debian 12/13 x86_64 的机器、约 40GB 空闲磁盘、能访问 OpenWRT 与 GitHub（走代理更稳）、海思 SDK 里的 `arm-hisiv100-linux.tar.bz2`。内核和 u-boot 源码仓库里都有，不用另外下。
+
+把下面这段整段粘过去，不要自己加"顺便优化一下"之类的要求，构建链对这个很敏感。
+
+```text
+你在一台 Debian 12/13 x86_64 机器上，帮我从零构建 Hi3520D 的 OpenWRT 19.07.10 固件，
+产物要能直接烧进 16MB SPI Flash。
+
+仓库：https://github.com/TZYLXS/hi3520d-openwrt
+工作目录：~/hi3520d
+
+步骤：
+1. 读仓库 README 的附录 A，按它装依赖、装海思工具链（arm-hisiv100-linux 是 i386 静态可执行，
+   需要 /lib32）、把 sdk/linux-3.0.y.tgz 解到 ~/hi3520d/kernel-3.0.8 并打 timeconst.pl 补丁、
+   拉 openwrt v19.07.10 到 ~/hi3520d/openwrt。
+2. 执行 bash scripts/build_owrt.sh；如果机器要走代理，把代理地址作为第一个参数传进去。
+3. 分区固定 1M(boot) + 4M(kernel) + 11M(rootfs)，rootfs 必须是 jffs2-64k，不要 squashfs。
+4. 构建完成后给出 out/images 下每个文件的大小和 md5sum。
+
+约束：
+- 报错时不要凭猜测改源码，先把完整报错和前后各 20 行日志贴出来，再按 README 附录 B 的排查表定位。
+- 遇到内核配置相关的中断，先确认 CONFIG_DEVMEM=y 和 CONFIG_TARGET_ROOTFS_JFFS2=y 还在，
+  这两个被 oldconfig 回写时最容易丢。
+- 镜像没有重新生成时，先看 build_dir 下 uImage 与 root.jffs2-64k 的时间戳，
+  再确认 image/Makefile 里的 TARGET_FILESYSTEMS 是否包含 jffs2-64k。
+
+验收：
+- out/images/hi3520d_16m.bin 恰好 16777216 字节
+- 偏移 0x100000 处 4 字节为 27 05 19 56（uImage 头）
+- 偏移 0x500000 处 4 字节为 85 19 03 20（jffs2 魔数）
+- 末尾到 0x1000000 之间是 0xFF 填充
+```
+
+要一并出烧录器镜像，再加一句：
+
+```text
+再执行 python3 scripts/make_programmer_image.py boot.bin kernel.bin rootfs.jffs2 out/，
+输入用 out/images 下同名文件，产出 hi3520d_16m_programmer.bin、boot_env_1m.bin、env.bin。
+```
+
+脚本签名是 `make_programmer_image.py <boot> <kernel> <rootfs> <outdir>`，参数少一个它会自己打印用法。
+
+验收项都在文件层面，不依赖板子：尺寸、两处魔数、填充值。这三样过了，镜像结构就是对的；能不能启动还得上板看串口。
+
+如果 AI 只能读文字、不能执行命令，那给它这段提示词的价值有限——它最多帮你把附录 A 的命令抄一遍。这种情况下把 `target/`、`scripts/`、`overlay/` 三个目录一起打包发过去，比多写几段描述有用。
+
 ## 参考文献
 
 1. HiSilicon. Hi3520D SDK 安装以及升级使用说明. `Hi3520D_SDK_V1.0.2.2` 发行包内 `01.software/board/documents_cn/`（n.d.）.

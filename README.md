@@ -2,6 +2,9 @@
 
 基于海思官方 SDK `Hi3520D_SDK_V1.0.2.2`（`Hi3520D_V100R001C01SPC022`）把 Hi3520D 板子适配成 OpenWRT 的一个 target，产出可烧写到 16MB SPI Flash 的镜像。
 
+- 仓库：<https://github.com/TZYLXS/hi3520d-openwrt>
+- 固件下载：<https://github.com/TZYLXS/hi3520d-openwrt/releases/tag/v1.0.0>
+
 - OpenWRT 版本：**v19.07.10**
 - 内核：**SDK 自带 linux-3.0.8**（海思私有 BSP：mach-hi3520d / hi_sfc / HIETH）
 - 用户空间：OpenWRT 自建 **musl** 工具链

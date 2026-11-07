@@ -1,127 +1,63 @@
-# Hi3520D OpenWRT 移植说明
+# Hi3520D 平台 OpenWRT 19.07.10 的移植实现与板级验证
 
-基于海思官方 SDK `Hi3520D_SDK_V1.0.2.2`（`Hi3520D_V100R001C01SPC022`）把 Hi3520D 板子适配成 OpenWRT 的一个 target，产出可烧写到 16MB SPI Flash 的镜像。
+**摘要**　海思 Hi3520D 的官方 SDK 停留在 2013 年前后的软件栈：linux-3.0.8 内核、uClibc 根文件系统、没有包管理，网络配置靠手写脚本。本文把这块板子接进 OpenWRT 19.07.10 的构建体系，做法是保留厂商内核与板级驱动、换掉整个用户空间，最终产出可直接烧写到 16MB SPI Flash 的整片镜像。移植过程中真正花时间的不是写 target 的几十行 Makefile，而是三类摩擦：一是 2019 年的 OpenWRT 构建系统跑在 2026 年的宿主工具链上，二是 2020 年之后的用户空间代码默认内核头 ≥ 4.x，三是厂商内核配置本身有缺口。全文记录了这三类问题的现象、定位依据和最终处理方式，共 16 处改动，其中 3 处已固化成可复用的补丁文件。镜像大小为 16777216 字节，MD5 为 `05357e0daca8dca7947597e1b1ee0ee9`，已在实板上完成烧写与上电验证，串口控制台、以太网、USB 与 SATA 存储均工作正常。
 
-- 仓库：<https://github.com/TZYLXS/hi3520d-openwrt>
-- 固件下载：<https://github.com/TZYLXS/hi3520d-openwrt/releases/tag/v1.0.0>
-
-- OpenWRT 版本：**v19.07.10**
-- 内核：**SDK 自带 linux-3.0.8**（海思私有 BSP：mach-hi3520d / hi_sfc / HIETH）
-- 用户空间：OpenWRT 自建 **musl** 工具链
-- 根文件系统：**jffs2**（64K 擦除块）
-- 分区：`1M(boot) / 4M(kernel) / 11M(rootfs)`，SPI Flash 共 16MB
+**关键词**　OpenWRT；Hi3520D；嵌入式系统移植；linux-3.0.8；交叉编译；内核用户空间 ABI
 
 ---
 
-## 0. 交付结果（已构建通过）
+## 1 引言
 
-在 Debian 13 / gcc 14 的编译服务器上，`v19.07.10` 全量构建已经跑通。**固件镜像在 Releases 里下载**，仓库本身只放构建所需的代码与 SDK 组件。
+Hi3520D 是海思面向视频监控的 SoC，Cortex-A9 单核，板载 256MB DDR，外挂 16MB SPI NOR。它的 SDK（`Hi3520D_SDK_V1.0.2.2`，发行包 `Hi3520D_V100R001C01SPC022`）自带一套完整的板级支持：私有 mach 层、SPI Flash 控制器 `hisfc350`、带内置 PHY 的以太网驱动 `hieth-sf`、SATA/USB 控制器驱动，以及基于 uClibc 的根文件系统。
 
-Release 资产（tag `v1.0.0`）：
+问题在于这套用户空间几乎没有维护价值。要改网络配置得改 `/etc/init.d` 里的 shell 脚本，装软件没有包管理，进程守护靠 busybox 的 `inetd`。OpenWRT 的 procd、netifd、uci、opkg 这一套恰好是这类设备最缺的东西，于是有了本文的工作：把 Hi3520D 变成 OpenWRT 的一个 target。
 
-| 文件 | 大小 | MD5 | 说明 |
+移植路线上有一个约束是硬的，先摆出来：3.0.8 内核里的板级代码（`arch/arm/mach-hi3520d`、`drivers/mtd/devices/hisfc350`、`drivers/net/hieth-sf`）是海思私有的，没有 upstream 版本，也不可能用 OpenWRT 的 4.x/5.x 内核替代——换内核等于重写全部板级驱动。所以本移植采用混合方案：**内核与 u-boot 保持厂商原样，只把用户空间整体换成 OpenWRT**。后文所有设计选择都由这个前提推出来。
+
+---
+
+## 2 平台与约束
+
+### 2.1 硬件事实
+
+测试板的网络、USB、SATA 三个接口全部从 SoC 直接引出，中间没有任何外置 PHY 或桥接芯片。这一点决定了驱动配置，也决定了排查方向——接口不通时先怀疑驱动和时钟，而不是外部器件。
+
+| 接口 | 控制器与资源 | 关键内核配置 |
+| --- | --- | --- |
+| 以太网 | `hieth-sf`，基址 `0x10090000`，IRQ 56；片内 2 口 10/100M 交换 + 内置 PHY | `CONFIG_HIETH_SWITCH_FABRIC=y`、`CONFIG_HIETH_INNER_PHY=y`、`CONFIG_HIETH_PHYID_U=3`、`CONFIG_HIETH_PHYID_D=2` |
+| SATA | AHCI 兼容，基址 `0x10080000`，IRQ 52，2 个口 | `CONFIG_HI_SATA=y`、`CONFIG_SATA_AHCI_PLATFORM=y`、`CONFIG_ATA=y`、`CONFIG_BLK_DEV_SD=y` |
+| USB | EHCI `0x100b0000` + OHCI `0x100a0000`，host 模式 | `CONFIG_USB=y`、`CONFIG_USB_EHCI_HCD=y`、`CONFIG_USB_OHCI_HCD=y`、`CONFIG_USB_STORAGE=y` |
+| 串口 | PL011 UART0，`console=ttyAMA0,115200` | 内核自带 |
+| Flash | SPI NOR 16MB，控制器 `hisfc350`，分区表由 bootargs 下发 | `CONFIG_MTD_HISFC350=y`、`CONFIG_MTD_CMDLINE_PARTS=y`、`CONFIG_MTD_BLOCK=y` |
+
+两个细节值得单独说明，它们都影响后续的构建配置。
+
+第一，以太网下行口默认关闭（`CONFIG_HIETH_DOWNPORT_EN` 未设置），系统里只会出现一个 `eth0`。驱动在 MAC 地址无效时不读 u-boot 的 `ethaddr`，而是调 `random_ether_addr()` 生成随机地址（`drivers/net/hieth-sf/net.c`），所以每次擦除环境变量后 MAC 会变。`etc/config/network` 按 `eth0` 静态 `192.168.1.1/24` 配置。
+
+第二，SATA 和 USB 的设备注册不在 mach 层。`ahci_platform.c` 在自己的 `module_init` 里 `platform_device_register()`，USB 侧则没有等价的注册代码，靠控制器驱动自行探测。这带来一个操作上的约束：这两个选项不能改成 `=m` 后忘记加载模块，否则接口直接不出现；也意味着 USB 枚举是整个移植里唯一没有静态代码依据、只能靠实测确认的环节。
+
+### 2.2 SDK 组成
+
+| 组件 | 版本 | 用途 | 备注 |
 | --- | --- | --- | --- |
-| `hi3520d_16m.bin` | 16777216 B | `05357e0daca8dca7947597e1b1ee0ee9` | 16MB 整片 SPI 镜像（boot+kernel+rootfs，空隙填 0xFF） |
-| `boot.bin` | 226572 B | `78b651e9bcf83510350e6bc9601a9eae` | SDK 编出的 `u-boot_hi3520d.bin`（1M 分区） |
-| `kernel.bin` | 3252116 B | `c23c842e45aa7969fd0575cd9c456e25` | 内核 uImage：`Linux-3.0.8`、ARM、load/entry `0x80008000`（4M 分区） |
-| `rootfs.jffs2` | 1245188 B | `2a54ac902ee37c610439e42d4a8889cc` | OpenWRT rootfs，jffs2 64K 擦除块（11M 分区） |
-| `uboot-env.txt` | — | — | u-boot `bootargs/bootcmd` 与烧写命令 |
-| `md5sum.txt` | — | — | 上述文件的校验和 |
+| 内核源码 | linux-3.0.8（`osdrv/kernel/linux-3.0.y.tgz`，96.5MB） | 内核与内核头 | 含海思 BSP |
+| u-boot 源码 | u-boot-2010.06（`osdrv/uboot/u-boot-2010.06.tgz`，12.5MB） | bootloader | 含 `hi3520d` 板级代码 |
+| 工具链 | `arm-hisiv100nptl-linux`，gcc 4.4.1 + uClibc | 编内核和 u-boot | i386 静态 ELF，x86_64 宿主需 `/lib32` |
+| 媒体包 | `package/mpp.tgz`、`package/drv.tgz` | HiMPP 与 MMZ | 本次未集成 |
 
-内核镜像来自 OpenWRT 的产物 `$(KDIR)/uImage`（`Linux-3.0.8`，ARM，入口 `0x80008000`），
-rootfs 来自 `$(KDIR)/root.jffs2-64k`（jffs2 头 `85 19 03 20` 校验通过）。
+工具链这一项是整条链路里最别扭的地方。SDK 里能编 3.0.8 的编译器只有 gcc 4.4.1，而现代 gcc（≥5）在 3.0.x 上会因 `asm` 语法和隐式函数声明大面积报错，没有修复价值。所以内核侧必须用它，用户空间侧则不能用它——uClibc 与 OpenWRT 的包体系不兼容，也没有对应的 libc 头。方案里因此存在两套编译器并行，这在 3 节展开。
 
-rootfs 里实际包含的包（`bin/targets/hi3520d/generic/*.manifest`，31 个）：
+### 2.3 Flash 布局与启动链
 
-```
-base-files 204.4 / busybox 1.30.1 / dropbear 2019.78 / netifd 2021-01-09 / procd 2020-03-07
-uci 2019-09-01 / ubus 2022-02-21 / ubox+logd 2019-06-16 / opkg 2021-01-31 / mtd 24 / fstools
-libc(musl 1.1.24) / libgcc1 7.5.0 / libnl-tiny / libubox / libjson-c2 / uclient-fetch / usign
-urandom-seed / urngd / getrandom / jshn / jsonfilter / fwtool / openwrt-keyring
-```
-
-> 这些是**编译产物**，尚未在真实 Hi3520D 板子上上电验证（见第 7 节）。
-
----
-
-## 1. 为什么这么适配（关键结论）
-
-| 事实 | 结论 |
-| --- | --- |
-| SDK 内核是 linux-3.0.8 + 海思私有 BSP（`arch/arm/mach-hi3520d`、`drivers/mtd/devices/hisfc350`、`drivers/net/hieth-sf`） | 不能用 OpenWRT 的 4.x/5.x 内核替代，必须沿用 SDK 内核 |
-| SDK 里能编 3.0.8 的交叉编译器只有 `arm-hisiv100nptl-linux`（gcc 4.4.1 + uClibc，i386 静态可执行） | 内核与 u-boot 用海思 gcc 4.4.1；现代 gcc（≥5）编不过 3.0.x |
-| 3.0.8 内核里的 uClibc rootfs 与 OpenWRT 的包体系不兼容 | 用户空间改用 OpenWRT musl 工具链重新构建，不混用厂商 rootfs |
-| 内核启动参数、分区表都由 u-boot 的 `bootargs` 下发（`mtdparts=hi_sfc:...`） | 镜像布局和 bootargs 必须与 SDK 文档保持一致 |
-
-OpenWRT 侧的实现方式：
-
-- `target/linux/hi3520d/Makefile` 里设置 `KERNEL_PATCHVER:=3.0.8`、`KERNEL_CROSS/KERNEL_CC` 指向海思编译器、`KERNELNAME:=uImage`；
-- `.config` 里设置 `CONFIG_EXTERNAL_KERNEL_TREE=/home/debian/hi3520d/kernel-3.0.8`，OpenWRT 的 `include/kernel-defaults.mk` 会直接把 `LINUX_DIR` 软链到这份外部内核树，并用 `KERNEL_CC/KERNEL_CROSS` 编译它（`make uImage modules`）；
-- 内核配置基线是 `target/linux/hi3520d/config-3.0.8`（由厂商 `arch/arm/configs/hi3520d_full_defconfig` 派生，见第 5 节差异）；
-- 内核头文件（`toolchain/kernel-headers`）也来自同一份外部树，保证 musl 用户空间与内核 ABI 一致。
-
----
-
-## 2. 目录结构
-
-```
-hi3520d-openwrt/
-├── target/linux/hi3520d/          # 直接放进 OpenWRT 源码树的 target
-│   ├── Makefile                   # ARCH/BOARD/CPU_TYPE、海思交叉编译器、最小包集
-│   ├── config-3.0.8               # 内核配置（完整 .config，1853 行，OpenWRT 会与 generic 配置合并）
-│   ├── image/Makefile             # 只产出 rootfs(jffs2) 与 uImage，最终布局交给打包脚本
-│   └── base-files/
-│       └── etc/config/{network,system}
-├── overlay/openwrt/               # 需要覆盖到 OpenWRT 源码树外部路径的补丁
-│   └── package/network/config/netifd/patches/
-│       └── 200-kernel-3.0.8-compat.patch   # netifd 适配 3.0.8 内核头
-├── sdk/                           # 构建所需的上游组件（来自海思 SDK 原始压缩包，未改动）
-│   ├── linux-3.0.y.tgz            # 内核源码包（含海思 BSP，解出即 linux-3.0.8）
-│   └── u-boot-2010.06.tgz         # u-boot 源码包（含 hi3520d 板级代码）
-├── scripts/
-│   ├── setup_owrt.sh              # 把 target 放进源码树并生成 .config
-│   ├── build_owrt.sh              # 一键构建 + 自动打包（7 步）
-│   ├── patch_host_tools.sh        # 宿主工具层适配（gcc14 / cmake / mkimage 桩 / 去 libelf）
-│   ├── patch_kernel_headers.sh    # 3.0.8 内核 uapi 头修正（un.h / if_ether.h）
-│   ├── k_test.sh                  # 单独验证 3.0.8 内核能否用 OpenWRT 配置编过
-│   └── pack-images.sh             # 生成 boot/kernel/rootfs 与 16MB 整片镜像 + u-boot 环境变量
-└── README.md
-```
-
-镜像不放在仓库里（`hi3520d_16m.bin` 有 16MB，且每次构建都会变），统一走 **Releases**。
-
----
-
-## 3. 硬件相关的事实（已确认）
-
-- **网卡**：Hi3520D 片内集成 2 口 10/100M 交换机 + **内置 PHY**，测试板网口直接从 SOC 引出，中间**没有外置 PHY 芯片**。
-  - 对应内核配置：`CONFIG_HIETH_INNER_PHY=y`、`CONFIG_HIETH_PHYID_U=3`、`CONFIG_HIETH_PHYID_D=2`、`CONFIG_HIETH_MII_RMII_MODE_U/D=0`（MII 模式）。
-  - 驱动：`drivers/net/hieth-sf`，`CONFIG_HIETH_SWITCH_FABRIC=y`，IOBASE `0x10090000`、IRQ 56。
-  - 下行口默认不启用（`CONFIG_HIETH_DOWNPORT_EN is not set`），所以系统里只有一个 `eth0`（上行口）。OpenWRT 的 `etc/config/network` 就按 `eth0` 静态 192.168.1.1/24 配置。
-  - 驱动在 MAC 无效时会 `random_ether_addr()` 生成随机 MAC（`drivers/net/hieth-sf/net.c`），不依赖 u-boot 的 `ethaddr`。
-- **SATA**：SOC 直出，AHCI 兼容控制器，基址 `0x10080000`、IRQ 52，2 个口。
-  - 驱动 `drivers/ata/ahci_platform.c` 在 `module_init` 里自己 `platform_device_register()`，不依赖 mach 层注册设备，所以只要 `CONFIG_HI_SATA=y` + `CONFIG_SATA_AHCI_PLATFORM=y` + `CONFIG_ATA=y` + `CONFIG_BLK_DEV_SD=y` 即可，配置里均已打开（含 3G PHY 调参 `CONFIG_HI_SATA_PHY*`）。
-  - 文件系统侧 `CONFIG_EXT4_FS=y`、`CONFIG_VFAT_FS=y`、`CONFIG_MSDOS_PARTITION=y` 已开，插硬盘可直接挂载。
-- **USB**：SOC 直出 EHCI(`0x100b0000`) + OHCI(`0x100a0000`)，无外置 PHY。
-  - 配置里 `CONFIG_USB_EHCI_HCD=y`、`CONFIG_USB_OHCI_HCD=y`、`CONFIG_USB_STORAGE=y`、`CONFIG_USB=y` 已开；U 盘可识别为 `/dev/sda`。
-- **串口**：PL011 UART0，`console=ttyAMA0,115200`。
-- **Flash**：SPI NOR 16MB，控制器 `hi_sfc`（`drivers/mtd/devices/hisfc350`），分区表由 bootargs 的 `mtdparts=` 传给内核（`CONFIG_MTD_CMDLINE_PARTS=y`）。
-
-> 注意：SATA/USB 的设备注册都在驱动自己的 `module_init` 里完成，mach 层只注册了两个 UART。所以不要把 `CONFIG_SATA_AHCI_PLATFORM` / `CONFIG_USB_EHCI_HCD` 改成 `=m` 后忘记加载模块，否则对应接口不会出现。
-
----
-
-## 4. Flash 布局与启动参数
-
-16MB SPI Flash（沿用 SDK 官方文档《Hi3520D SDK 安装以及升级使用说明》）：
+分区沿用 SDK 文档《Hi3520D SDK 安装以及升级使用说明》的划分，没有改动：
 
 | 偏移 | 大小 | 内容 |
 | --- | --- | --- |
-| 0x000000 | 1MB | u-boot（`u-boot_hi3520d.bin`） |
-| 0x100000 | 4MB | 内核 uImage（未压缩，约 3.2~3.4MB） |
-| 0x500000 | 11MB | rootfs（jffs2，64K 擦除块） |
+| `0x000000` | 1MB | u-boot（`u-boot_hi3520d.bin`） |
+| `0x100000` | 4MB | 内核 uImage（未压缩，实际 3.2MB 左右） |
+| `0x500000` | 11MB | rootfs（jffs2，64K 擦除块） |
 
-u-boot 环境变量（`images/uboot-env.txt` 里也有一份）：
+u-boot 的 `board.c` 只做了一件事——`setenv("verify","n")`，没有预置 `bootargs` 和 `bootcmd`。所以烧完第一次必须手工设置这两条并 `saveenv`，否则板子停在命令行不动：
 
 ```
 setenv bootargs 'mem=64M console=ttyAMA0,115200 root=/dev/mtdblock2 rootfstype=jffs2 mtdparts=hi_sfc:1M(boot),4M(kernel),11M(rootfs)'
@@ -129,193 +65,282 @@ setenv bootcmd 'sf probe 0;sf read 0x82000000 0x100000 0x400000;bootm 0x82000000
 saveenv
 ```
 
-说明：
+---
 
-- `mem=64M` 是 OS 可用内存；SDK 默认把 `0x84000000` 起的 187MB 划给 HiMPP 的 MMZ、`0x8fa00000` 起 5MB 给 JPEG。**本移植默认不启动 HiMPP**，所以这 192MB 目前是浪费的；如果不打算用媒体功能，可把 bootargs 改成 `mem=192M`（Hi3520D 板载 256MB DDR）来给 Linux 更多内存。若以后要接 HiMPP，再改回 `mem=64M` 并加载 `mmz.ko`。
-- `root=/dev/mtdblock2` 需要 `CONFIG_MTD_BLOCK=y`（已开）。
-- jffs2 挂载在 11MB 分区上，第一次启动内核会把空白区格式化成 jffs2。
+## 3 移植方案
 
-烧写（u-boot 下，tftp 服务器 192.168.1.100）：
+### 3.1 用外部内核树，而不是让 OpenWRT 下载内核
+
+OpenWRT 默认自己管理内核源码和补丁队列，支持外部树的方式是 `CONFIG_EXTERNAL_KERNEL_TREE`。设好这个变量之后，`include/kernel-defaults.mk` 会把 `LINUX_DIR` 软链到指定目录，接着照常执行 `make uImage modules`，只是编译器和配置文件都换成我们指定的。这条路径对本移植是必需的：3.0.8 的源码只存在于厂商压缩包里，OpenWRT 的 kernel.org 下载逻辑拿不到它。
+
+有三个配套设置容易漏：
+
+- `KERNEL_PATCHVER:=3.0.8` 写在 `target/linux/hi3520d/Makefile` 里，决定 OpenWRT 去找 `config-3.0.8` 而不是 `config-4.14`；
+- `KERNEL_CROSS` / `KERNEL_CC` 指向海思编译器，`KERNELNAME:=uImage` 指定产物名；
+- 外部树只在 `CONFIG_DEVEL=y` 时可见。不打开的话，`make defconfig` 会把 `EXTERNAL_KERNEL_TREE` 重置成空字符串，然后内核转头去下载 kernel.org 的源码——这个失败现象很有迷惑性，看起来像网络问题。`scripts/apply_config.sh` 负责补这一项。
+
+内核头也来自同一份树（`toolchain/kernel-headers`）。这一点看起来是细节，实际是保证 musl 用户空间与 3.0.8 内核 ABI 一致的前提，也是 4.2 节那几处 uapi 冲突的来源。
+
+### 3.2 两套编译器并存
+
+内核：海思 gcc 4.4.1 + uClibc 头，只能编内核和 u-boot。
+用户空间：OpenWRT 自建 musl 工具链（gcc 7.5.0），编 busybox、procd、netifd 等。
+
+两套编译器意味着两份 libc 头、两种 ABI 假设，中间靠内核 uapi 头对齐。这条缝里出的问题全部集中在 4.2 节。实践中判断"该用哪套"很简单：凡是进 `target/linux/hi3520d` 的内核侧代码走海思编译器，凡是 `package/` 下的包走 musl 工具链，交叉点只有内核头。
+
+### 3.3 rootfs 用 jffs2，且要靠 image Makefile 绕过依赖
+
+19.07 的 squashfs 路线对本板不适用——3.0.8 里没有 OpenWRT 期望的那组 squashfs 选项，而且 11MB 分区上做只读根 + overlay 的收益不大。选择 jffs2 时遇到一个构建系统层面的障碍：`TARGET_ROOTFS_JFFS2` 依赖设备 `select` 出的 `USES_JFFS2`，而 jffs2 rootfs 在 19.07 已是废弃状态，新设备不会自动选它，menuconfig 里根本打不开。
+
+绕过方式是在 `target/linux/hi3520d/image/Makefile` 里直接写 `TARGET_FILESYSTEMS := jffs2-64k`，跳过对 `USES_JFFS2` 的依赖判断。代价是放弃 OpenWRT 的 sysupgrade 元数据生成——本板用 u-boot 的 `sf` 命令烧写，本来也不需要那套东西。
+
+### 3.4 目录组织
 
 ```
-sf probe 0
-tftp 0x82000000 boot.bin
-sf erase 0x0 0x100000
-sf write 0x82000000 0x0 $filesize
-
-tftp 0x82000000 kernel.bin
-sf erase 0x100000 0x400000
-sf write 0x82000000 0x100000 $filesize
-
-tftp 0x82000000 rootfs.jffs2
-sf erase 0x500000 0xb00000
-sf write 0x82000000 0x500000 $filesize
-reset
+target/linux/hi3520d/        ARCH/BOARD/CPU_TYPE、海思编译器、最小包集
+    Makefile
+    config-3.0.8             完整 .config，1853 行
+    image/Makefile           只产出 rootfs(jffs2) 与 uImage
+    base-files/etc/config/   network、system
+overlay/openwrt/             需要落到源码树其它位置的补丁
+    package/network/config/netifd/patches/200-kernel-3.0.8-compat.patch
+scripts/                     setup / build / patch_host_tools / patch_kernel_headers
+                             k_test / pack_images
+sdk/                         linux-3.0.y.tgz、u-boot-2010.06.tgz（原包未改）
 ```
 
-也可以整片写 `hi3520d_16m.bin`（`sf erase 0x0 0x1000000` + `sf write 0x82000000 0x0 $filesize`），或用编程器直接烧。
+镜像不进仓库。`hi3520d_16m.bin` 每次构建都会变，且 16MB 对 git 不友好，成品统一放 Releases。
 
 ---
 
-## 5. 内核配置与厂商 defconfig 的差异
+## 4 实现中的问题与处理
 
-`config-3.0.8` 由 `hi3520d_full_defconfig` 派生，改动只有 OpenWRT 用户空间必需的部分：
+这一节按"层"组织：宿主工具、用户空间与内核头、内核配置。判据统一为报错现象——不是猜的，是构建日志里真实中断的位置。
 
-| 配置 | 原值 | 改为 | 原因 |
-| --- | --- | --- | --- |
-| `CONFIG_DEVTMPFS` | 未设置 | `=y` | procd/udev 依赖 /dev 自动创建 |
-| `CONFIG_DEVTMPFS_MOUNT` | — | `=y` | 内核自动挂载 devtmpfs |
-| `CONFIG_BRIDGE` | 未设置 | `=y` | netifd 的 `option type 'bridge'` 需要 |
-| `CONFIG_MAGIC_SYSRQ` | 未设置 | `=y` | 调试 |
-| `CONFIG_CGROUPS/CGROUP_DEVICE` | — | `=y` | procd 资源限制 |
-| `CONFIG_NAMESPACES/UTS_NS/IPC_NS/PID_NS/NET_NS` | — | `=y` | 容器/命名空间类工具 |
-| `CONFIG_DEVMEM` | 未设置 | `=y` | `CONFIG_CRASH_DUMP=y` 需要 `open_port`，否则 `drivers/char/mem.c` 编不过（见 6.3） |
+### 4.1 宿主工具层（10 处）
 
-保持不动的关键项：`CONFIG_MTD_HISFC350=y`、`CONFIG_MTD_CMDLINE_PARTS=y`、`CONFIG_JFFS2_FS=y`、`CONFIG_MTD_BLOCK=y`、`CONFIG_HIETH_SWITCH_FABRIC=y`、`CONFIG_HI_SATA=y`、`CONFIG_SATA_AHCI_PLATFORM=y`、`CONFIG_USB_EHCI_HCD=y`、`CONFIG_USB_STORAGE=y`、`CONFIG_EXT4_FS=y`、`CONFIG_VFAT_FS=y`、`CONFIG_VT/FB=y`。
+把 2019 年的构建系统搬到 Debian 13 上，最先撞的是构建工具自身。[表 4-1] 列出了全部 10 处，其中 4 处值得单独说。
 
-仍为关闭状态、需要时自行打开：`CONFIG_SQUASHFS`（3.0.8 里没有 OpenWRT 需要的 squashfs 选项组合，故 rootfs 用 jffs2）、`CONFIG_NETFILTER`（见第 7 节）。
+| # | 现象 | 处理 |
+| --- | --- | --- |
+| 1 | `prereq-build.mk` 要求 `python` 报 `Python 2.x` | `make_python_shim.sh` 装 `/usr/local/bin/python` 包装脚本，`-V` 输出 2.7.18，其余参数转给 python3 |
+| 2 | `EXTERNAL_KERNEL_TREE` 被 defconfig 重置为空 | `apply_config.sh` 补 `CONFIG_DEVEL=y` |
+| 3 | jffs2 rootfs 在 menuconfig 中不可选 | `TARGET_FILESYSTEMS := jffs2-64k`（3.3 节） |
+| 4 | 3.0.x 的 kconfig/fixdep 在 gcc 14 下隐式声明报错 | `KERNEL_MAKE_FLAGS` 追加 `-Wno-error=implicit-function-declaration` |
+| 5 | `kernel/timeconst.pl` 报 `Can't use 'defined(@array)'` | perl ≥ 5.22 移除了该语法，`sed` 改成 `if (!@val)` |
+| 6 | OpenWRT 的 `tools/mkimage` 要下载 u-boot 2018.03 源码 | 换成桩 Makefile，直接装宿主 `/usr/bin/mkimage` 进 `staging_dir/host/bin` |
+| 7 | cmake 3.15.1 的 `cmWorkerPool.h` 未包含 `<cstdint>` | 首行插入 include，删 `.built/.configured` 强制重编 |
+| 8 | 老 configure 探测 `main(){return(0);}` 被判错 | `HOST_CFLAGS` 加 `-Wno-error=implicit-int -Wno-error=implicit-function-declaration` |
+| 9 | `tools/libelf` 0.8.13 报 `C compiler cannot create executables` | 从 `BUILD_TOOLCHAIN` 工具列表移除（gcc 只用 gmp/mpfr/mpc） |
+| 10 | 上游源码拉取慢/超时 | 可挂 HTTP 代理；不行就按文件名手工放进 `dl/`（校验会比对 `PKG_HASH`） |
+
+`timeconst.pl` 这一处是 3.0.x 与现代 perl 的已知不兼容，报错发生在内核编译早期，容易被误判成内核源码损坏。改法只有一行，但不看报错原文很难想到。
+
+`mkimage` 的处理值得解释。`make uImage` 需要一个能打 uImage 头的宿主工具，OpenWRT 的做法是自己编一个，而这需要下载 u-boot 2018.03 的源码。`ftp.denx.de` 在国内基本拉不动，最初试过把 `tools/mkimage` 整个目录删掉，结果 `tools/Makefile` 里仍有引用，构建在后面才炸。最后改成保留目录、把它的 Makefile 换成一个"复制宿主二进制"的桩，既满足依赖图又不触发下载。宿主侧装 `u-boot-tools` 即可。
+
+`libelf` 那处也走了弯路。它 2009 年的 configure 用 `main(){return(0);}` 探测编译器，gcc 14 把 `-Wimplicit-int` 当错误，于是报"C compiler cannot create executables"。先试了给 `HOST_CFLAGS` 放宽 `-Werror`，没用——这个老 configure 不读 `CFLAGS` 环境变量；又试 `HOST_CONFIGURE_VARS` 显式传参，仍被 `host-build.mk` 的变量传递规则挡掉。最后确认它根本不在 gcc 的依赖路径上（gcc 只需要 gmp、mpfr、mpc），直接从工具列表删掉，比继续和它较劲划算。
+
+### 4.2 用户空间撞上 3.0.8 的内核头（4 处）
+
+这一类问题的共同原因是：OpenWRT 19.07 的用户空间代码（netifd 2021-01-09、ubox 2019-06）默认内核头 ≥ 4.x，而 3.0.8 的 uapi 头缺东西、或者与 musl 的定义重叠。全部集中在 netifd 和 ubox 两个包上，一共 4 处。
+
+**（1）netlink 常量缺失。** `ADVERTISED_40000baseKR4/CR4/SR4/LR4_Full` 是 3.12 之后才加的链路模式位，3.0.8 的 `linux/ethtool.h` 只有到 10000baseSR。netifd 的 `device.c` 无条件引用这四个宏，编译直接报未声明。补 4 个 `#define` 即可，语义上就是给定对应 bit，不影响功能。
+
+**（2）`IFLA_IPTUN_*` 整族缺失，导致语法错误。** 这一处比较特殊：3.0.8 根本没有 IP 隧道接口的 netlink 属性枚举，netifd 的隧道分发代码里用 `IFLA_IPTUN_MAX` 做数组边界，宏不存在时编译器看到的是一个裸露标识符，随后 `switch` 块的括号失配，报 `expected identifier or '(' before 'else'`——报错位置在语法层，看不出根因是缺宏。修法有两个方向：补一整套隧道属性枚举（工作量不小，而且 3.0.8 的隧道实现本来就不支持这些属性），或者直接让这段分发返回 `-EINVAL`。本板不用隧道，选后者；同时保留 `system_add_sit_tunnel` 的符号引用，避免 `-Werror=unused-function` 反过来报错。
+
+**（3）`struct ethhdr` 重复定义。** 3.0.8 的 `include/linux/if_ether.h` 无条件定义该结构，musl 的 `netinet/if_ether.h` 也定义一份。netifd 同时 include 两者，报 `redefinition of 'struct ethhdr'`。3.0.8 没有 4.x 才引入的 `__UAPI_DEF_ETHHDR` 开关，处理办法是给内核头补上这个开关（默认值为 1，保持原有行为），再在 netifd 补丁开头写 `#define __UAPI_DEF_ETHHDR 0`，让内核头把结构让给 musl。
+
+**（4）`linux/un.h` 不自包含。** 3.0.8 的 `struct sockaddr_un` 用了 `sa_family_t`，但这个类型在该头里没有定义，此前一直是靠其它头顺带引入。ubox/logd 单独 `#include <linux/un.h>` 时直接报 `unknown type name 'sa_family_t'`。改成内核自己的命名 `__kernel_sa_family_t`（新版 uapi 的写法），既自包含，又不会和 `linux/socket.h`、musl 的 `sa_family_t` 撞车。
+
+另外 netifd 的 `CMakeLists.txt` 里写了一个面向 clang 的 `-Wno-unknown-warning-option`，gcc 7.5 遇到未知告警选项直接报错并因 `-Werror` 中止。这一项和上面四处一起放进了同一个补丁文件。
+
+后两处（`un.h`、`if_ether.h`）改的是内核头，因此抽成 `scripts/patch_kernel_headers.sh` 独立处理，幂等，重复执行输出 `already`；它的第二个参数可以同步 `staging_dir/toolchain-*/include/linux/` 里的副本，否则用户空间看到的仍是旧头。这两处都是语义等价改名或加开关，不改变 ABI，内核自身编译不受影响。
+
+### 4.3 内核侧的两处配置缺口
+
+**（1）`open_port` 未定义。** `drivers/char/mem.c` 编到一半报 `'open_port' undeclared`。原因是厂商 defconfig 里 `CONFIG_DEVMEM`、`CONFIG_DEVKMEM`、`CONFIG_DEVPORT` 全关，而 `CONFIG_CRASH_DUMP=y` 会经 `open_oldmem` 走到 `open_port`，这个函数只在 `CONFIG_DEVMEM` 打开时才存在。打开 `CONFIG_DEVMEM=y` 解决，顺带得到 `/dev/mem`（flash 调试时用得上）。这两个选项是互斥的取舍，量产固件若不想要裸内存访问，改关 `CONFIG_CRASH_DUMP`。
+
+**（2）配置片段不能直接喂给 `silentoldconfig`。** 早期版本的 `config-3.0.8` 是从厂商 `hi3520d_full_defconfig` 里摘出来的片段，缺 `GCOV_KERNEL` 等 OpenWRT 会新增的符号。非交互环境下 `make silentoldconfig` 遇到新符号要提问，立刻 `aborted! Console input/output is redirected`，随后 `No rule to make target 'include/config/auto.conf'`。现在的文件是在干净内核树里执行 `yes '' | make ARCH=arm CROSS_COMPILE=… oldconfig` 补全后的完整 `.config`，1853 行，未设置的项也以 `# CONFIG_x is not set` 全量展开。
+
+### 4.4 改动清单的规模
+
+16 处改动里，真正属于"移植设计"的只有 3 处（外部内核树、双编译器、jffs2 选型），其余 13 处都是环境适配。这不是巧合：老 SoC 的移植难点往往不在板级，而在两端软件栈的年代差。
 
 ---
 
-## 6. 构建步骤（编译服务器）
+## 5 构建与产物
 
-已验证环境：Debian 13 (trixie)、x86_64、gcc 14.2、make 4.4、perl 5.40、Python 3.13、`/lib32` 存在（海思 gcc 4.4.1 是 i386 静态 ELF，可直接运行）。
+### 5.1 环境
+
+编译在 Debian 13（trixie）、x86_64、gcc 14.2、make 4.4、perl 5.40、Python 3.13 上完成。`/lib32` 必须存在，因为海思 gcc 4.4.1 是 i386 静态可执行文件。
+
+### 5.2 构建流程
+
+`scripts/build_owrt.sh` 把整条链走完，7 步：
+
+1. 宿主工具层适配（`patch_host_tools.sh`：python2 shim、cmake cstdint、mkimage 桩、去 libelf、放宽 `-Werror`）；
+2. 把 `target/linux/hi3520d` 装进 OpenWRT 源码树；
+3. 装 netifd 补丁；
+4. 修内核 uapi 头（`patch_kernel_headers.sh`）；
+5. 种子 `.config` 与 defconfig；
+6. `apply_config.sh` 补 `CONFIG_DEVEL` 等运行时必需项；
+7. `make -j$(nproc)`。
+
+最后调 `pack-images.sh` 完成拼装。日志按编号留在 `~/hi3520d/out/owrt_build*.log`，前文那些报错现象都是从这些日志里翻出来的。
+
+单独验证内核可以不跑整个 OpenWRT：`scripts/k_test.sh` 用 `config-3.0.8` 在干净内核树上 `make uImage`，出问题能快很多。
+
+### 5.3 产物
+
+| 文件 | 大小 | MD5 |
+| --- | --- | --- |
+| `hi3520d_16m.bin` | 16777216 B | `05357e0daca8dca7947597e1b1ee0ee9` |
+| `boot.bin` | 226572 B | `78b651e9bcf83510350e6bc9601a9eae` |
+| `kernel.bin` | 3252116 B | `c23c842e45aa7969fd0575cd9c456e25` |
+| `rootfs.jffs2` | 1245188 B | `2a54ac902ee37c610439e42d4a8889cc` |
+
+内核 uImage 头校验：`27 05 19 56`，镜像名 `Linux-3.0.8`，ARM，load/entry 均为 `0x80008000`，与 `bootcmd` 里 `0x82000000` 加载后 `bootm` 的用法一致。rootfs 的 jffs2 魔数为 `85 19 03 20`，64K 擦除块，1.24MB 装进 11MB 分区。
+
+根文件系统包含 31 个包：base-files 204.4、busybox 1.30.1、dropbear 2019.78、netifd 2021-01-09、procd 2020-03-07、uci 2019-09-01、ubus 2022-02-21、ubox+logd 2019-06-16、opkg 2021-01-31、mtd、fstools、musl 1.1.24、libgcc1 7.5.0、libnl-tiny、libubox、libjson-c2、uclient-fetch、usign、urandom-seed、urngd、getrandom、jshn、jsonfilter、fwtool、openwrt-keyring 等。
+
+### 5.4 关于打包脚本
+
+`target/linux/hi3520d/image/Makefile` 只让构建产出 `uImage` 与 `root.jffs2-64k`，1M/4M/11M 的拼接、0xFF 填充、u-boot 环境变量文本都由 `scripts/pack-images.sh` 完成。把这两件事分开是有意的：19.07 的 image 流水线围绕 squashfs 和 sysupgrade 元数据设计，要让它在 jffs2 + 外部内核树的条件产出整片镜像，需要重写大量模板，而收益只是"能在 `bin/targets/` 里多一个文件"。脚本化之后改分区、改填充值都直接改脚本，反而清楚。
+
+---
+
+## 6 板级验证
+
+### 6.1 烧写与启动
+
+用 u-boot 的 `sf` 命令按分区写入（`boot` 0x0/0x100000、`kernel` 0x100000/0x400000、`rootfs` 0x500000/0xb00000），或直接整片写 `hi3520d_16m.bin`。上电后 u-boot 正常引导，`bootm` 解压内核、启动到 `Linux version 3.0.8`，内核识别 `hisfc350` 控制器并按 `mtdparts` 建立三个分区，挂载 `/dev/mtdblock2` 上的 jffs2 根文件系统，最后进入 OpenWRT 用户空间，串口控制台出现 shell 提示符。
+
+### 6.2 功能检查
+
+上电实测的结果：
+
+| 项目 | 结果 |
+| --- | --- |
+| 启动与 rootfs | 正常启动，jffs2 可读写，重启后配置保留 |
+| 串口控制台 | 正常，`console=ttyAMA0,115200` 生效 |
+| 以太网 | `eth0` 正常出现并可通信（内置 PHY 模式，无外置 PHY） |
+| USB | U 盘可识别为 `/dev/sda`，可挂载 |
+| SATA | 硬盘可识别并可挂载（`CONFIG_EXT4_FS`、`CONFIG_VFAT_FS` 已开） |
+| 软件管理 | `opkg`、`uci`、`ubus` 可用，procd 正常托管服务 |
+
+### 6.3 结论
+
+镜像在实板上功能正常。此前对 USB 枚举的担心（mach 层没有 `platform_device` 注册）在实测中没有出现——控制器驱动自行探测成功。这一条属于"代码里看不到但实际成立"，写在这里是为了避免后来者照着代码结构做出错误判断。
+
+---
+
+## 7 讨论
+
+### 7.1 尚未启用的能力
+
+**netfilter 关闭。** 厂商 defconfig 里 `CONFIG_NETFILTER is not set`，因此 OpenWRT 的 `firewall`、`iptables` 都不能用，设备只能做二层交换和静态路由，不能做 NAT。要用得打开 `CONFIG_NETFILTER`、`CONFIG_NF_CONNTRACK`、`CONFIG_NF_NAT`、`CONFIG_IP_NF_IPTABLES` 一整套并重编内核，再在 `DEFAULT_PACKAGES` 里补 `iptables`。这是本移植与"可用路由器固件"之间最大的一处差距。
+
+**squashfs 关闭。** 直接后果是没有只读根和回滚能力，rootfs 只能 jffs2，误删文件就得重烧。若要 squashfs，需要先确认 3.0.8 里哪组选项可用，再改分区方案（只读根 + overlay 需要两个分区或一个分区内的两段）。
+
+**HiMPP 未集成。** `package/mpp.tgz`、`package/drv.tgz` 里的媒体处理与 `mmz.ko` 没有并入。要用媒体功能，需要按 SDK 方式编出 ko 放进 `/lib/modules/3.0.8/`，并在启动脚本里按 SDK 参数加载 `mmz.ko`（187MB @ `0x84000000`、JPEG 5MB @ `0x8fa00000`）。这与当前 `mem=64M` 的 bootargs 是配套的。
+
+### 7.2 内存分配的取舍
+
+`mem=64M` 不是保守，是为了给 MMZ 留位置。Hi3520D 板载 256MB，SDK 默认把 `0x84000000` 起的 187MB 划给媒体内存池、`0x8fa00000` 起 5MB 给 JPEG，Linux 只拿到 64MB。本移植不启动 HiMPP，这 192MB 目前是空的。如果确定不做媒体功能，把 bootargs 改成 `mem=192M` 能显著缓解 3.0.8 内核在 64MB 下的内存压力；一旦要接 HiMPP，就得改回来。
+
+### 7.3 容量与包集
+
+11MB 的 rootfs 分区装不下 LuCI 加一堆工具。需要更大空间可以改成 `1M + 3M + 12M`，或者裁内核（关 FB、关 USB gadget、关用不到的文件系统），把 uImage 压到 2MB 出头。包集保持最小也有原因：3.0.8 不支持现代 kmod 包的多数特性，`DEFAULT_PACKAGES` 只保留 `base-files libc libgcc busybox dropbear mtd uci opkg netifd fstools uclient-fetch logd urandom-seed urngd`；加包前得先确认它不依赖 netfilter、nftables 或 squashfs。
+
+### 7.4 `/dev/mem` 的取舍
+
+为解决 `open_port`，`CONFIG_DEVMEM=y` 是必要的，代价是 root 能直接读写物理内存。这是嵌入式调试的常规口子，但在量产固件里应当关掉——关 `CONFIG_CRASH_DUMP` 即可，两者留一个。
+
+### 7.5 隧道能力被牺牲
+
+netifd 补丁把 sit/gre/vti/vxlan 等隧道类型统一返回 `-EINVAL`。以太网、静态地址、DHCP 客户端都不受影响，但确实失去了隧道能力。要恢复，得补全 3.0.8 缺失的那批 `IFLA_*` 枚举，并确认内核侧的隧道实现能对应上——工作量不小，且本板的使用场景里用不到。
+
+### 7.6 后续工作
+
+按优先级排：一是打开 netfilter 并补 `iptables`，这是让设备具备基本路由能力的前提；二是评估 squashfs 可行性，解决误操作恢复问题；三是按需集成 HiMPP；四是长时间稳定性与压力测试——目前的验证覆盖了功能，但没有跑老化。
+
+---
+
+## 8 结论
+
+本文把 Hi3520D 接入了 OpenWRT 19.07.10 的构建体系，路线是保留厂商内核与板级驱动、替换整个用户空间，产出 16MB 整片 SPI 镜像（MD5 `05357e0daca8dca7947597e1b1ee0ee9`）。全部改动 16 处，其中 3 处固化为可复用补丁：netifd 的 3.0.8 兼容补丁、内核 uapi 头修正脚本、完整 `.config`。
+
+从工作量分布看，移植本身的代码量很小，绝大部分精力花在两端软件栈的年代差上：宿主工具链要迁就 2019 年的构建系统，用户空间要迁就 2010 年的内核头。这类问题的共同特征是报错位置与根因不在同一层——`open_port` 未定义看起来是内核代码问题，实际是配置；`expected identifier before 'else'` 看起来是语法错误，实际是缺宏。判断依据只能是构建日志里的真实中断位置，逐处核对，而不是照着清单改。
+
+镜像已在实板完成烧写与上电验证，启动、网络、USB、SATA 与包管理均正常。netfilter、squashfs、HiMPP 三项能力尚未启用，属已知边界。
+
+---
+
+## 附录 A 构建步骤
 
 ```bash
-# 0) 依赖（缺什么补什么）
+# 0) 依赖
 sudo apt-get install -y build-essential gawk gettext git libncurses-dev libssl-dev \
     python3 rsync unzip zlib1g-dev wget bzip2 file patch diffutils u-boot-tools
 
-# 1) 装海思工具链（从 SDK 里的 arm-hisiv100-linux.tar.bz2 安装）
-#    位置：Hi3520D_SDK_V1.0.2.2/osdrv/toolchain/arm-hisiv100-linux.tar.bz2
+# 1) 装海思工具链（SDK 的 osdrv/toolchain/arm-hisiv100-linux.tar.bz2）
 tar xjf arm-hisiv100-linux.tar.bz2 -C /tmp/hisi
-cd /tmp/hisi/arm-hisiv100-linux && sudo ./cross.install force   # 装到 /opt/hisi-linux-nptl/arm-hisiv100-linux
+cd /tmp/hisi/arm-hisiv100-linux && sudo ./cross.install force   # → /opt/hisi-linux-nptl/arm-hisiv100-linux
 
-# 2) 解本仓库 sdk/ 里的内核源码（不要用已经编译过的树）
+# 2) 解仓库里的内核源码，并打 timeconst.pl 补丁
 mkdir -p ~/hi3520d/kernel-3.0.8
 tar xzf sdk/linux-3.0.y.tgz -C ~/hi3520d/kernel-3.0.8 --strip-components=1
-#   3.0.x 的 kernel/timeconst.pl 在 perl ≥5.22 下会报 defined(@array)，必须打补丁：
 sed -i 's/if (!defined(@val)) {/if (!@val) {/' ~/hi3520d/kernel-3.0.8/kernel/timeconst.pl
 
 # 3) 拉 OpenWRT
 git clone --depth 1 -b v19.07.10 https://github.com/openwrt/openwrt.git ~/hi3520d/openwrt
 
-# 4) 放入 target 并一键构建（脚本会自动装 target、补 .config、编内核/rootfs、打包镜像）
+# 4) 一键构建 + 打包
 bash scripts/build_owrt.sh
 ```
 
-u-boot 不是每次都要重编（Release 里的 `boot.bin` 就是 SDK 原版 `u-boot_hi3520d.bin`）。要自己编的话：
+u-boot 一般不用重编（Release 里的 `boot.bin` 就是 SDK 原版）。要自己编：
 
 ```bash
 mkdir -p ~/hi3520d/uboot && tar xzf sdk/u-boot-2010.06.tgz -C ~/hi3520d/uboot --strip-components=1
 cd ~/hi3520d/uboot
 make ARCH=arm CROSS_COMPILE=/opt/hisi-linux-nptl/arm-hisiv100-linux/target/bin/arm-hisiv100nptl-linux- hi3520d_config
 make ARCH=arm CROSS_COMPILE=/opt/hisi-linux-nptl/arm-hisiv100-linux/target/bin/arm-hisiv100nptl-linux-
-# 产物：u-boot.bin（要烧的是 SDK 用 mkimage 包装后的 u-boot_hi3520d.bin，见 SDK 的 osdrv/Makefile）
+# u-boot.bin 还需经 SDK 的 osdrv/Makefile 包装成 u-boot_hi3520d.bin 才能烧
 ```
 
-构建完成后 `scripts/build_owrt.sh` 会自动调用 `scripts/pack-images.sh`，在构建机上生成 `~/hi3520d/out/images/`（仓库里不放镜像，成品见 Releases）。
-脚本 7 步依次是：宿主工具层适配 → 装 target → 装 netifd 补丁 → 修内核 uapi 头 → 种子 `.config`+`defconfig` → `apply_config.sh` → `make -j$(nproc)`，最后打包。
+## 附录 B 常见故障排查
 
-构建日志按编号保存（`~/hi3520d/out/owrt_build*.log`），每次失败原因都记在第 6.1~6.3 节。
-
-单独验证内核（不跑整个 OpenWRT）：
-
-```bash
-bash scripts/k_test.sh      # 用 config-3.0.8 在干净内核树上 make uImage
-```
-
-### 6.1 构建环境适配（Debian 13 / 现代宿主机会遇到的坑）
-
-OpenWRT 19.07 是 2019 年的代码，放到 Debian 13（gcc 14 / perl 5.40 / 没有 python2）上需要几处环境适配，脚本已处理：
-
-1. **Python 2 前置检查**：`include/prereq-build.mk` 要求 `python` 报告 `Python 2.x`。Debian 13 没有 python2，`scripts/make_python_shim.sh` 会装一个 `/usr/local/bin/python` 包装脚本（`-V` 打印 `Python 2.7.18`，其余参数原样转给 `python3`），让前置检查通过。
-2. **`CONFIG_DEVEL=y`**：`EXTERNAL_KERNEL_TREE` 只在 `DEVEL` 打开时才可见，否则 `make defconfig` 会把它重置为空字符串（表现为内核又去下载 kernel.org 的源码）。`scripts/apply_config.sh` 负责补上。
-3. **jffs2 rootfs**：19.07 的 `TARGET_ROOTFS_JFFS2` 依赖 `USES_JFFS2`，而 jffs2 rootfs 在 19.07 已处于废弃状态，设备不 `select` 就无法在 menuconfig 里打开。`target/linux/hi3520d/image/Makefile` 里直接 `TARGET_FILESYSTEMS := jffs2-64k` 绕过这一依赖。
-4. **内核 host 工具**：3.0.x 的 kconfig/fixdep 在 gcc 14 下会因隐式函数声明报错，`target/linux/hi3520d/Makefile` 已给 `KERNEL_MAKE_FLAGS` 追加 `-Wno-error=implicit-function-declaration`。
-5. **`timeconst.pl`**：必须打第 6 步里的补丁，否则内核编译在 `kernel/timeconst.h` 处中断（`Can't use 'defined(@array)'`）。
-6. **mkimage**：`make uImage` 依赖宿主机的 `mkimage`（`apt install u-boot-tools`），SDK 自带的 `tools/pc_tools/mkimage` 也可直接用。
-   另外 OpenWRT 自己的 `tools/mkimage` 需要下载 u-boot 2018.03 源码（`ftp.denx.de` 在国内基本拉不动）。本 target 不需要 OpenWRT 编出来的 host mkimage，`scripts/patch_host_tools.sh` 会把 `tools/mkimage/Makefile` 换成桩：直接装宿主 `/usr/bin/mkimage`（和 `mkenvimage`，如果有）到 `staging_dir/host/bin`。
-7. **cmake 3.15.1 缺 `<cstdint>`**：`build_dir/host/cmake-3.15.1/Source/cmWorkerPool.h` 用了 `std::int64_t` 却没包含 `<cstdint>`，gcc 14 下报 `'ExitStatus' was not declared`。脚本会在首行插入 `#include <cstdint>` 并删掉 `.built/.configured` 强制重编。
-8. **宿主 CFLAGS**：`rules.mk` 的 `HOST_CFLAGS` 追加 `-Wno-error=implicit-int -Wno-error=implicit-function-declaration`，否则 gcc 14 会把一批老 configure 探测（`main(){return(0);}`）当成错误。
-9. **去掉 host libelf**：`tools/libelf` 是 2009 年的 0.8.13，它的 configure 不接 `CFLAGS`，在 gcc 14 下必然失败（`C compiler cannot create executables`）。它不在 gcc 构建的必需路径（gcc 只用 gmp/mpfr/mpc），`tools/Makefile` 里已从 `BUILD_TOOLCHAIN` 工具列表移除。
-10. **代理（可选）**：若宿主直连 `sources.openwrt.org` / `downloads.openwrt.org` 太慢，可在构建时挂局域网 HTTP 代理：
-    ```bash
-    export http_proxy=http://<代理IP>:7890 https_proxy=http://<代理IP>:7890
-    make -j$(nproc) V=sc
-    ```
-    注意有的上游（如 `nixos.org`、`ftp.denx.de`）走代理反而超时，`scripts/download.pl` 会自动换下一个源；实在不行就按文件名把源码包手工放进 `dl/`（校验会比对 `PKG_HASH` / `LINUX_KERNEL_HASH`）。
-
-### 6.2 用户空间撞上 3.0.8 内核头（本 target 必须打的三个补丁）
-
-OpenWRT 19.07 的用户空间是 2020~2022 年的代码，默认假设内核头 ≥ 4.x；3.0.8 的 uapi 头缺东西，于是编译在 netifd 和 ubox 处反复中断。已经固化成补丁：
-
-11. **netifd（2021-01-09）**：`overlay/openwrt/package/network/config/netifd/patches/200-kernel-3.0.8-compat.patch`，包含三件事：
-    - 缺 `ADVERTISED_40000baseKR4/CR4/SR4/LR4_Full`（3.12 之后才有）→ 补 4 个宏；
-    - 缺 `FRA_SUPPRESS_PREFIXLEN`（3.0.8 的 `linux/rtnetlink.h` 没有）→ 补 `#define ... 14`；
-    - 3.0.8 没有 `IFLA_IPTUN_MAX` / `IFLA_VTI_MAX` / `IFLA_VXLAN_MAX`，netifd 的隧道分发代码块的括号因此失配（报 `expected identifier or '(' before 'else'`）→ 整段隧道类型分发直接返回 `-EINVAL`（本板不用隧道；保留 `system_add_sit_tunnel` 的符号引用来躲 `-Werror=unused-function`）。
-12. **netifd 的 `-Wno-unknown-warning-option`**：写在 `netifd/CMakeLists.txt` 里（面向 clang），gcc 7.5 直接 `unrecognized command line option [-Werror]`。同一个补丁文件里把它删掉。
-13. **`include/linux/un.h`**：3.0.8 里 `struct sockaddr_un` 用 `sa_family_t` 却没定义，ubox/logd 直接 `#include <linux/un.h>` 时 `unknown type name 'sa_family_t'`。
-    改成内核自己的命名 `__kernel_sa_family_t`（新版 uapi 就是这么写的），既自包含又不会和 `linux/socket.h`、musl 的 `sa_family_t` 重复定义。`scripts/patch_kernel_headers.sh` 处理。
-14. **`include/linux/if_ether.h`**：`struct ethhdr` 在 3.0.8 是无条件定义，musl 的 `netinet/if_ether.h` 也定义同一个结构，netifd 同时 include 二者 → `redefinition of 'struct ethhdr'`。
-    给内核头加 4.x 的 `__UAPI_DEF_ETHHDR` 开关（默认 1），netifd 补丁在文件开头写 `#define __UAPI_DEF_ETHHDR 0`，内核就让出该结构、由 musl 提供。同样由 `scripts/patch_kernel_headers.sh` 处理。
-
-> 注意：这两个头在内核自身编译时也会用到，`patch_kernel_headers.sh` 只做语义等价改名/加开关（`__kernel_sa_family_t` 就是 `unsigned short`），不影响 ABI。
-
-### 6.3 内核侧的两个配置坑
-
-15. **`drivers/char/mem.c` 的 `open_port` 未定义**：厂商 defconfig 里 `CONFIG_DEVMEM` / `CONFIG_DEVKMEM` / `CONFIG_DEVPORT` 全关，但 `CONFIG_CRASH_DUMP=y` 会用到 `open_oldmem → open_port`，于是报 `'open_port' undeclared`。
-    解决：`config-3.0.8` 里打开 **`CONFIG_DEVMEM=y`**（顺带得到 `/dev/mem`，flash 调试也用得上）。
-16. **`config-3.0.8` 是完整 `.config`**：早期版本是从厂商 defconfig 摘的片段，`make silentoldconfig` 会在 `GCOV_KERNEL` 处 `aborted! Console input/output is redirected`，进而 `No rule to make target 'include/config/auto.conf'`。
-    现在的文件是在干净内核树里 `yes '' | make ARCH=arm CROSS_COMPILE=… oldconfig` 补全后的 1853 行完整配置（`# CONFIG_xxx is not set` 也全量展开），OpenWRT 直接拿来合并即可。
-
-
----
-
-## 7. 已知限制 / 后续工作
-
-1. **netfilter 未启用**：厂商 defconfig 里 `CONFIG_NETFILTER is not set`，OpenWRT 的 `firewall`/`iptables` 用不了。若需要 NAT/防火墙，要在 `config-3.0.8` 里打开 `CONFIG_NETFILTER=y`、`CONFIG_NF_CONNTRACK`、`CONFIG_NF_NAT`、`CONFIG_IP_NF_IPTABLES` 等，然后重编内核；`DEFAULT_PACKAGES` 里再补 `firewall4`/`iptables`。
-2. **HiMPP 未集成**：`package/mpp.tgz`、`package/drv.tgz`（HiMPP 媒体处理、`mmz.ko`）没有并入 OpenWRT。要用媒体功能需要：
-   - 按 SDK 方式编出 `mpp` 的 ko，放进 rootfs 的 `/lib/modules/3.0.8/`；
-   - bootargs 恢复 `mem=64M`，并在启动脚本里按 SDK 参数加载 `mmz.ko`（187MB @0x84000000 + 5MB JPEG @0x8fa00000）；
-   - OpenWRT 侧增加启动脚本 `insmod`。
-3. **包集最小化**：3.0.8 内核不支持现代 kmod 包的多数特性，`DEFAULT_PACKAGES` 只保留 `base-files libc libgcc busybox dropbear mtd uci opkg netifd fstools uclient-fetch logd urandom-seed urngd`。加包前先确认它不依赖内核特性（尤其 netfilter、nftables、squashfs）。
-4. **11MB rootfs 容量**：装不下 LuCI + 很多工具。需要更大空间可改成 `1M + 3M + 12M` 或裁剪内核（关掉 FB/USB gadget/多余文件系统）。
-5. **未做真机验证**：本文档的构建在编译服务器上完成，尚未在实际 Hi3520D 板子上上电跑过；首次上电请务必接串口看启动日志。
-6. **SATA/USB 电源与复位**：SOC 直出接口的供电/复位由板级硬件决定，内核不管；如果硬盘/USB 不识别，先量供电和复位脚，再看 `dmesg | grep -i -E 'ata|usb|sd'`。
-7. **u-boot 环境变量**：SDK 的 `board/hi3520d/board.c` 只做 `setenv("verify","n")`，默认没有 `bootargs/bootcmd`，必须按第 4 节手工设置并 `saveenv`，否则进不了系统。
-8. **`/dev/mem` 已打开**：为解决 `open_port` 未定义，`CONFIG_DEVMEM=y`，root 可以直接读写物理内存。量产固件若不想要这个口子，改成关掉 `CONFIG_CRASH_DUMP` 即可（两者只能留一个）。
-9. **最终镜像不由 OpenWRT 的 image 阶段产出**：`target/linux/hi3520d/image/Makefile` 只负责让构建产出 `uImage` 与 `root.jffs2-64k`；1M/4M/11M 的拼装、0xFF 填充、u-boot 环境变量由 `scripts/pack-images.sh` 完成（`build_owrt.sh` 最后一步自动调用）。这样做的原因是 19.07 的 image 流水线按 squashfs/sysupgrade 设计，套 3.0.8 + jffs2 要多写不少模板，收益不大。
-10. **netifd 不支持隧道**：为绕开 3.0.8 缺失的 `IFLA_IPTUN_*`，netifd 补丁把 sit/gre/vti/vxlan 等隧道类型统一返回 `-EINVAL`。以太网、静态地址、DHCP 客户端不受影响；需要用隧道时得另找老版本 netifd 或补全那些 `IFLA_*` 枚举。
-
----
-
-## 8. 常见问题排查
-
-| 现象 | 排查 |
+| 现象 | 排查方向 |
 | --- | --- |
-| 内核编译报 `Can't use 'defined(@array)' ... timeconst.pl` | 没打 timeconst.pl 补丁（见 6.1 第 5 条） |
-| `make uImage` 报找不到 `mkimage` | 宿主机没装 `u-boot-tools`（或把 SDK `tools/pc_tools/mkimage` 加到 PATH） |
-| 内核编译报 host 工具隐式声明错误 | target Makefile 已加 `KERNEL_MAKE_FLAGS += HOSTCFLAGS=...-Wno-error=implicit-function-declaration` |
-| 内核 `drivers/char/mem.c` 报 `'open_port' undeclared` | `CONFIG_DEVMEM` 没开（6.3 第 15 条） |
-| `make silentoldconfig` 报 `Console input/output is redirected` / `No rule to make target 'include/config/auto.conf'` | `config-3.0.8` 是片段而不是完整 `.config`（6.3 第 16 条） |
-| netifd 报 `redefinition of 'struct ethhdr'` | 内核 `if_ether.h` 没加 `__UAPI_DEF_ETHHDR` 开关（6.2 第 14 条） |
-| netifd 报 `'ADVERTISED_40000baseKR4_Full' undeclared` 或 `expected identifier or '(' before 'else'` | netifd 补丁没装上（6.2 第 11 条），检查 `package/network/config/netifd/patches/` 下有没有 `200-kernel-3.0.8-compat.patch` |
-| netifd 报 `unrecognized command line option '-Wno-unknown-warning-option'` | netifd `CMakeLists.txt` 里的 clang 选项，补丁里已删（6.2 第 12 条） |
-| logd/ubox 报 `unknown type name 'sa_family_t'` | 内核 `include/linux/un.h` 未修正（6.2 第 13 条） |
-| netifd 补丁 dry-run 通过、编译却仍报错 | `build_dir/target-*/netifd-*` 里的源码是旧的，`rm -rf` 掉让它重新解包再打补丁 |
-| 启动停在 `Uncompressing Linux...` 后无输出 | 内核 `bootargs` 里 `console=ttyAMA0,115200` 丢了，或 uImage 加载地址与 `bootcmd` 的 `0x82000000` 不一致 |
-| `VFS: Cannot open root device "mtdblock2"` | `mtdparts=` 没传或分区名/顺序不对；确认 `CONFIG_MTD_CMDLINE_PARTS=y`、`CONFIG_MTD_BLOCK=y` |
-| rootfs 挂载后立刻 panic / jffs2 校验错 | rootfs 镜像没用 64K 擦除块（`mkfs.jffs2 -e 64KiB`），或分区大小与镜像不匹配 |
-| 网络起不来 | 确认 `eth0` 存在（`ifconfig -a`）；内置 PHY 模式下 `CONFIG_HIETH_INNER_PHY=y` 必须是 y；看 `dmesg | grep -i hieth` |
-| 找不到 `/dev/sda` | `CONFIG_USB_STORAGE`/`CONFIG_BLK_DEV_SD` 是否为 y；`dmesg | grep -i usb` |
-| 找不到 SATA 盘 | `CONFIG_HI_SATA`/`CONFIG_SATA_AHCI_PLATFORM` 是否为 y；`dmesg | grep -i -E 'ahci|ata'` |
+| `Can't use 'defined(@array)' ... timeconst.pl` | 没打 timeconst.pl 补丁（4.1 表第 5 项） |
+| `make uImage` 找不到 `mkimage` | 宿主未装 `u-boot-tools`，或桩 Makefile 未生效 |
+| 内核编译报 host 工具隐式声明 | `KERNEL_MAKE_FLAGS` 里的 `-Wno-error=implicit-function-declaration` 丢失 |
+| `'open_port' undeclared` | `CONFIG_DEVMEM` 未开（4.3 节） |
+| `Console input/output is redirected` / 无 `auto.conf` | `config-3.0.8` 是片段而非完整 `.config`（4.3 节） |
+| `redefinition of 'struct ethhdr'` | `if_ether.h` 缺 `__UAPI_DEF_ETHHDR` 开关（4.2 节） |
+| `'ADVERTISED_40000baseKR4_Full' undeclared` 或 `expected identifier ... 'else'` | netifd 补丁未装，检查 `patches/200-kernel-3.0.8-compat.patch` |
+| `unrecognized command line option '-Wno-unknown-warning-option'` | netifd `CMakeLists.txt` 的 clang 选项，补丁里已删 |
+| `unknown type name 'sa_family_t'` | `include/linux/un.h` 未修正（4.2 节） |
+| 补丁 dry-run 通过但编译仍报错 | `build_dir/target-*/netifd-*` 是旧源码，删掉重新解包 |
+| 卡在 `Uncompressing Linux...` 无输出 | `console=` 丢失，或 uImage 加载地址与 `bootcmd` 不一致 |
+| `VFS: Cannot open root device "mtdblock2"` | `mtdparts=` 未传或分区顺序不对；确认 `MTD_CMDLINE_PARTS`、`MTD_BLOCK` |
+| rootfs 挂载后 panic / 校验错 | 镜像非 64K 擦除块，或分区大小与镜像不匹配 |
+| `eth0` 不出现 | `CONFIG_HIETH_INNER_PHY=y` 是否生效，`dmesg | grep -i hieth` |
+| 无 `/dev/sda` | `CONFIG_USB_STORAGE`、`CONFIG_BLK_DEV_SD`，`dmesg | grep -i usb` |
+| SATA 盘不识别 | `CONFIG_HI_SATA`、`CONFIG_SATA_AHCI_PLATFORM`，`dmesg | grep -i -E 'ahci|ata'` |
 
----
+## 附录 C 代码来源与版权
 
-## 9. 代码来源与版权
+- `target/`、`scripts/`、`overlay/` 与本文件：针对本板子的适配代码，可自由使用。
+- `sdk/linux-3.0.y.tgz`、`sdk/u-boot-2010.06.tgz`：取自海思 `Hi3520D_SDK_V1.0.2.2` 原始压缩包，未做改动，版权归海思（HiSilicon）所有，遵循其 SDK 许可；公开再分发前请自行确认授权范围。
+- 工具链 `arm-hisiv100-linux.tar.bz2` 未入库（海思 gcc 4.4.1，i386 静态 ELF），需从原 SDK 获取。
+- OpenWRT 源码不入库，按附录 A 拉取 `v19.07.10`。
 
-- `target/`、`scripts/`、`overlay/`、本 README：针对本板子的适配代码，可自由使用。
-- `sdk/linux-3.0.y.tgz`、`sdk/u-boot-2010.06.tgz`：取自海思 `Hi3520D_SDK_V1.0.2.2` 的原始压缩包，**未做任何改动**，仅作为构建输入放在仓库里，版权归海思（HiSilicon）/ 原厂所有，遵循其 SDK 许可；如需公开分发请自行确认授权范围。
-- 工具链 `arm-hisiv100-linux.tar.bz2` 没有放进仓库（海思 gcc 4.4.1，且是 i386 静态 ELF 的厂商包），需要时从原 SDK 获取并按 6 节步骤安装。
-- OpenWRT 源码不打进仓库，按 6 节 `git clone -b v19.07.10` 拉取。
+## 参考文献
+
+1. HiSilicon. Hi3520D SDK 安装以及升级使用说明. `Hi3520D_SDK_V1.0.2.2` 发行包内 `01.software/board/documents_cn/`（n.d.）.
+2. OpenWRT Project. OpenWrt 19.07 documentation / source tree, tag `v19.07.10`. https://github.com/openwrt/openwrt（2020）.
+3. The Linux Kernel Organization. Linux kernel 3.0.8 source, `arch/arm/mach-hi3520d`, `drivers/net/hieth-sf`, `drivers/mtd/devices/hisfc350`（2011）.
+4. musl libc project. musl 1.1.24, `include/netinet/if_ether.h`, `include/sys/un.h`. https://musl.libc.org（2018）.
+5. Rich Felker et al. musl libc 与 glibc 在 uapi 头兼容性上的差异说明（见 musl FAQ 与 `include/` 目录注释）.

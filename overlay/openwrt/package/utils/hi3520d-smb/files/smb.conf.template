@@ -1,0 +1,43 @@
+[global]
+	netbios name = |NAME|
+	server string = |DESCRIPTION|
+	workgroup = |WORKGROUP|
+	display charset = |CHARSET|
+	unix charset = |CHARSET|
+	interfaces = |INTERFACES|
+	bind interfaces only = yes
+	security = user
+	passdb backend = smbpasswd
+	smb passwd file = /etc/samba/smbpasswd
+	map to guest = Never
+	null passwords = no
+	invalid users = root
+	local master = no
+	domain master = no
+	dns proxy = no
+	enable core files = no
+	deadtime = 15
+	max protocol = SMB2
+
+	# 单核 Cortex-A9、无 NEON：大块数据交给内核搬，减少用户态拷贝
+	use sendfile = yes
+	min receivefile size = 16384
+	large readwrite = yes
+	read raw = yes
+	write raw = yes
+
+	# 一次目录列举/小文件交互就是几十个往返，关掉 Nagle 少等一个 RTT
+	socket options = TCP_NODELAY
+
+	# 没有打印机。Windows 连上来会枚举打印机，这一步在弱 CPU 上最费时间
+	load printers = no
+	printing = bsd
+	printcap name = /dev/null
+	disable spoolss = yes
+
+	# 日志落到 jffs2 会拖慢整机，默认只留错误
+	log level = 0
+	max log size = 50
+
+	# 磁盘上的文件属主不一定是 smbuser，统一按该身份落盘，避免只读
+	force user = smbuser

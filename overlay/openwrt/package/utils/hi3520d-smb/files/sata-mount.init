@@ -1,0 +1,77 @@
+#!/bin/sh /etc/rc.common
+#
+# 把 SoC 的两个 SATA 口上的盘挂到 /mnt/sata1、/mnt/sata2。
+# 盘可能出现得比 rcS 晚，这里最多等 15 秒。
+
+START=40
+
+WAIT_SEC=15
+
+is_mounted() {
+	grep -qs "$1 " /proc/mounts
+}
+
+try_mount() {
+	local dev="$1" dir="$2" fs="$3" opts="$4"
+
+	if [ "$fs" = auto ]; then
+		mount -o "$opts" "$dev" "$dir" 2>/dev/null
+	else
+		mount -t "$fs" -o "$opts" "$dev" "$dir" 2>/dev/null
+	fi
+}
+
+mount_disk() {
+	local dev="$1" dir="$2" part= i=0
+
+	while [ "$i" -lt "$WAIT_SEC" ]; do
+		if [ -b "/dev/${dev}1" ]; then
+			part="/dev/${dev}1"
+			break
+		fi
+		if [ -b "/dev/${dev}" ]; then
+			part="/dev/${dev}"
+			break
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+
+	if [ -z "$part" ]; then
+		logger -t sata-mount "$dev: no disk"
+		return 1
+	fi
+
+	is_mounted "$dir" && return 0
+
+	# ext4 上关 barrier、用 writeback：单核上 journal 提交的开销比丢掉最后几笔写更值
+	try_mount "$part" "$dir" ext4 "rw,noatime,data=writeback,nobarrier" && return 0
+	try_mount "$part" "$dir" ext4 "rw,noatime" && return 0
+	try_mount "$part" "$dir" ext3 "rw,noatime" && return 0
+	try_mount "$part" "$dir" ext2 "rw,noatime" && return 0
+	try_mount "$part" "$dir" vfat "rw,noatime,iocharset=utf8" && return 0
+	try_mount "$part" "$dir" auto "rw,noatime" && return 0
+
+	logger -t sata-mount "$part: unknown filesystem"
+	return 1
+}
+
+start() {
+	local dev dir
+
+	mkdir -p /mnt/sata1 /mnt/sata2
+
+	mount_disk sda /mnt/sata1
+	# Samba 以 smbuser(1000) 的身份写盘，挂载点的属主跟着改
+	chown 1000:1000 /mnt/sata1 2>/dev/null
+
+	mount_disk sdb /mnt/sata2
+	chown 1000:1000 /mnt/sata2 2>/dev/null
+
+	logger -t sata-mount "mounted: $(grep -c '/mnt/sata' /proc/mounts) of 2"
+}
+
+stop() {
+	umount /mnt/sata1 2>/dev/null
+	umount /mnt/sata2 2>/dev/null
+}

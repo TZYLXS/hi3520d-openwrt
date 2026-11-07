@@ -1,0 +1,36 @@
+#!/bin/sh /etc/rc.common
+#
+# 建 SMB 账号：smbuser 这个 unix 用户 + smbpasswd 口令库。
+# 只在第一次启动时创建口令，之后改密码用 smbpasswd -a smbuser。
+
+START=50
+
+start() {
+	local u p
+
+	u=$(uci -q get samba.@samba[0].smbuser)
+	u=${u:-smbuser}
+	p=$(uci -q get samba.@samba[0].smbpass)
+	p=${p:-hi3520d}
+
+	grep -q "^smbshare:" /etc/group || echo "smbshare:x:1000:" >> /etc/group
+	grep -q "^$u:" /etc/passwd || \
+		echo "$u:x:1000:1000:$u:/mnt:/bin/false" >> /etc/passwd
+
+	mkdir -p /etc/samba
+	if [ ! -f /etc/samba/smbpasswd ]; then
+		: > /etc/samba/smbpasswd
+	fi
+	chmod 600 /etc/samba/smbpasswd
+
+	# 已有口令条目就不覆盖，免得每次开机都重置用户改过的密码
+	grep -q "^$u:" /etc/samba/smbpasswd && return 0
+
+	printf '%s\n%s\n' "$p" "$p" | smbpasswd -s -a "$u" >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		logger -t smbuser "smbpasswd -a $u failed"
+		return 1
+	fi
+
+	logger -t smbuser "samba account $u created"
+}

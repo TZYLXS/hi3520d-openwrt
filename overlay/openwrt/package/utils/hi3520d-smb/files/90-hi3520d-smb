@@ -1,0 +1,22 @@
+#!/bin/sh
+# 首次启动时把随包附带的 Samba 配置落到标准位置。
+# 直接装到 /etc/config/samba、/etc/samba/smb.conf.template 会和 samba36-server
+# 的默认文件互相覆盖（取决于 opkg 安装顺序），所以先放在 /etc/hi3520d-smb/，
+# 等所有包都装完、uci-defaults 统一执行时再复制过去。
+
+SRC=/etc/hi3520d-smb
+
+mkdir -p /etc/samba /mnt/sata1 /mnt/sata2
+
+if [ -f "$SRC/samba.config" ]; then
+	cp -f "$SRC/samba.config" /etc/config/samba
+fi
+
+if [ -f "$SRC/smb.conf.template" ]; then
+	cp -f "$SRC/smb.conf.template" /etc/samba/smb.conf.template
+fi
+
+# smbpasswd 只允许 root 读，smbd 才能拿到口令库
+[ -f /etc/samba/smbpasswd ] && chmod 600 /etc/samba/smbpasswd
+
+exit 0

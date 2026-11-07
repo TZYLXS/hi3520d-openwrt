@@ -1,8 +1,8 @@
 # Hi3520D 平台 OpenWRT 19.07.10 的移植实现与板级验证
 
-**摘要**　海思 Hi3520D 的官方 SDK 停留在 2013 年前后的软件栈：linux-3.0.8 内核、uClibc 根文件系统、没有包管理，网络配置靠手写脚本。本文把这块板子接进 OpenWRT 19.07.10 的构建体系，做法是保留厂商内核与板级驱动、换掉整个用户空间，最终产出可直接烧写到 16MB SPI Flash 的整片镜像。移植过程中真正花时间的不是写 target 的几十行 Makefile，而是三类摩擦：一是 2019 年的 OpenWRT 构建系统跑在 2026 年的宿主工具链上，二是 2020 年之后的用户空间代码默认内核头 ≥ 4.x，三是厂商内核配置本身有缺口。全文记录了这三类问题的现象、定位依据和最终处理方式，共 16 处改动，其中 3 处已固化成可复用的补丁文件。镜像大小为 16777216 字节，MD5 为 `05357e0daca8dca7947597e1b1ee0ee9`，已在实板上完成烧写与上电验证，串口控制台、以太网、USB 与 SATA 存储均工作正常。
+**摘要**　海思 Hi3520D 的官方 SDK 停留在 2013 年前后的软件栈：linux-3.0.8 内核、uClibc 根文件系统、没有包管理，网络配置靠手写脚本。本文把这块板子接进 OpenWRT 19.07.10 的构建体系，做法是保留厂商内核与板级驱动、换掉整个用户空间，最终产出可直接烧写到 16MB SPI Flash 的整片镜像。移植过程中真正花时间的不是写 target 的几十行 Makefile，而是三类摩擦：一是 2019 年的 OpenWRT 构建系统跑在 2026 年的宿主工具链上，二是 2020 年之后的用户空间代码默认内核头 ≥ 4.x，三是厂商内核配置本身有缺口。全文记录了这三类问题的现象、定位依据和最终处理方式，共 16 处改动，其中 3 处已固化成可复用的补丁文件。镜像大小为 16777216 字节，MD5 为 `23432c522bdb115ede327cc17bb9361c`，已在实板上完成烧写与上电验证，串口控制台、以太网、USB 与 SATA 存储均工作正常。在此之上又做了一轮功能扩展：把 SMB 共享做进固件、让 SoC 的两个 SATA 口都参与挂载，并给外部编程器单独出了一份带 u-boot 环境的整片镜像。
 
-**关键词**　OpenWRT；Hi3520D；嵌入式系统移植；linux-3.0.8；交叉编译；内核用户空间 ABI；交流群：778213624
+**关键词**　OpenWRT；Hi3520D；嵌入式系统移植；linux-3.0.8；交叉编译；内核用户空间 ABI
 
 ---
 
@@ -194,14 +194,19 @@ sdk/                         linux-3.0.y.tgz、u-boot-2010.06.tgz（原包未改
 
 | 文件 | 大小 | MD5 |
 | --- | --- | --- |
-| `hi3520d_16m.bin` | 16777216 B | `05357e0daca8dca7947597e1b1ee0ee9` |
+| `hi3520d_16m.bin` | 16777216 B | `23432c522bdb115ede327cc17bb9361c` |
+| `hi3520d_16m_programmer.bin` | 16777216 B | `216da5217d4f6bb75679908fdb654920` |
 | `boot.bin` | 226572 B | `78b651e9bcf83510350e6bc9601a9eae` |
+| `boot_env_1m.bin` | 1048576 B | `4208a78827a2970b85b5a6fccb56683b` |
+| `env.bin` | 262144 B | `61078564c5f04aecca91007541ec9629` |
 | `kernel.bin` | 3252116 B | `c23c842e45aa7969fd0575cd9c456e25` |
-| `rootfs.jffs2` | 1245188 B | `2a54ac902ee37c610439e42d4a8889cc` |
+| `rootfs.jffs2` | 2293764 B | `06101bbc82b52de1f08d4b3f11b181a3` |
 
-内核 uImage 头校验：`27 05 19 56`，镜像名 `Linux-3.0.8`，ARM，load/entry 均为 `0x80008000`，与 `bootcmd` 里 `0x82000000` 加载后 `bootm` 的用法一致。rootfs 的 jffs2 魔数为 `85 19 03 20`，64K 擦除块，1.24MB 装进 11MB 分区。
+`hi3520d_16m.bin` 是给 `sf` 命令整片写入用的，u-boot 环境区是空白；`hi3520d_16m_programmer.bin` 把环境变量焊进了 `0x80000`，适合 CH341A 一类的编程器直接写，细节见附录 D。`boot_env_1m.bin` 是含环境的 1MB boot 分区内容，`env.bin` 是可以单独写到 `0x80000` 的 0x40000 环境块。
 
-根文件系统包含 31 个包：base-files 204.4、busybox 1.30.1、dropbear 2019.78、netifd 2021-01-09、procd 2020-03-07、uci 2019-09-01、ubus 2022-02-21、ubox+logd 2019-06-16、opkg 2021-01-31、mtd、fstools、musl 1.1.24、libgcc1 7.5.0、libnl-tiny、libubox、libjson-c2、uclient-fetch、usign、urandom-seed、urngd、getrandom、jshn、jsonfilter、fwtool、openwrt-keyring 等。
+内核 uImage 头校验：`27 05 19 56`，镜像名 `Linux-3.0.8`，ARM，load/entry 均为 `0x80008000`，与 `bootcmd` 里 `0x82000000` 加载后 `bootm` 的用法一致。rootfs 的 jffs2 魔数为 `85 19 03 20`，64K 擦除块，2.19MB 装进 11MB 分区。
+
+根文件系统包含 33 个包：在原 31 个基础上加了 `samba36-server` 3.6.25 与 `hi3520d-smb`（本地包，只带脚本和配置）。其余为 base-files 204.4、busybox 1.30.1、dropbear 2019.78、netifd 2021-01-09、procd 2020-03-07、uci 2019-09-01、ubus 2022-02-21、ubox+logd 2019-06-16、opkg 2021-01-31、mtd、fstools、musl 1.1.24、libgcc1 7.5.0、libnl-tiny、libubox、libjson-c2、uclient-fetch、usign、urandom-seed、urngd、getrandom、jshn、jsonfilter、fwtool、openwrt-keyring 等。
 
 ### 5.4 关于打包脚本
 
@@ -234,9 +239,55 @@ sdk/                         linux-3.0.y.tgz、u-boot-2010.06.tgz（原包未改
 
 ---
 
-## 7 讨论
+## 7 SMB 存储与双 SATA
 
-### 7.1 尚未启用的能力
+### 7.1 需求
+
+硬件这一侧很直接：板上底部两个 SATA 座都接到 SoC 的 SATA 控制器，要求两口都能挂盘；共享走账号密码验证，客户端可读可写；CPU 是单核 Cortex-A9、没有 NEON，SMB 的参数不能照抄 PC 上的思路。
+
+### 7.2 内核侧不需要改
+
+`config-3.0.8` 里 `CONFIG_HI_SATA=y`、`HI_SATA_IOBASE=0x10080000`、`IOSIZE=0x10000`、`IRQNUM=52`、`HI_SATA_PORTS=2`、`MODE=0` 本来就在。`ahci_sys.c` 用 `n_ports = CONFIG_HI_SATA_PORTS` 决定端口数，`ahci_sys_hi3520d_defconfig.c` 按这个宏逐个上电、开时钟、解复位，两个口的 `CKEN`、`TX_RST`、`RX_RST` 都是独立的。驱动由 `ahci_platform.c` 在 `module_init` 里自注册 platform_device，所以内核这边只要 `BLK_DEV_SD`、`EXT4_FS`、`VFAT_FS` 开着，两口就能出 `/dev/sdX`。这一版没有改内核。
+
+### 7.3 用户空间：一个包加两个脚本
+
+新增 `package/utils/hi3520d-smb`，`DEPENDS:=+samba36-server`，装 `/etc/init.d/sata-mount`、`/etc/init.d/smbuser`，以及 Samba 的 uci 配置和 `smb.conf.template`。
+
+`sata-mount` 的 `START=40`，开机后最多等 15 秒，轮询等 `sda`、`sdb` 出现；挂载顺序是 `ext4(writeback,nobarrier)` → `ext4` → `ext3` → `ext2` → `vfat(utf8)` → `auto`，哪个能挂就用哪个，分别落到 `/mnt/sata1`、`/mnt/sata2`，挂上后 `chown 1000:1000`，配合 SMB 的 `force user` 直接可写。`stop()` 里两块盘都 `umount`。
+
+这个脚本不做无限重试：盘到位慢就等满 15 秒，再慢只能手工 `mount`，避免开机被一块坏盘拖住。
+
+### 7.4 账号与权限
+
+`security = user`，`passdb backend = smbpasswd`，`map to guest = Never`，`null passwords = no`，`invalid users = root`；共享项 `read_only = no`、`guest_ok = no`，`create_mask 0664`、`dir_mask 0775`，`force user = smbuser`。默认账号 `smbuser`、口令 `hi3520d`，改 `/etc/config/samba` 里的 `smbuser`、`smbpass` 两项即可。
+
+`smbuser` 的 `START=50`，比 samba 的 `START=60` 早一步：从 uci 读账号口令，`/etc/passwd`、`/etc/group` 里没有 uid/gid 1000 的条目就补一条，`smbpasswd` 库里没有该用户才执行 `smbpasswd -a`，最后 `chmod 600 /etc/samba/smbpasswd`。重复启动不会重复建号。
+
+### 7.5 性能上的取舍
+
+模板保留了 `use sendfile = yes`、`min receivefile size = 16384`、`max protocol = SMB2`，另外打开 `large readwrite`、`read raw`、`write raw` 和 `socket options = TCP_NODELAY`，把打印子系统整个关掉（`load printers = no`、`printcap name = /dev/null`、`disable spoolss`），日志压到 `log level = 0`、`max log size = 50`，`deadtime = 15`。
+
+理由都在 CPU 上：单核 A9 没有 NEON，SMB 的瓶颈不是磁盘带宽，而是每字节的拷贝和协议往返。`sendfile` 让 3.0.8 内核做零拷贝，SMB2 减少往返次数，关打印是因为 `smbd` 启动时会探测打印机，在没有并口的板子上纯属浪费。
+
+关于 `ext4` 的 `data=writeback,nobarrier`：换来的是写入延迟更低，代价是掉电可能丢最近几秒的数据。这个取舍适合共享盘，不适合当数据库盘。
+
+### 7.6 打包阶段遇到的三个问题
+
+**包编译报 "No targets specified and no makefile found"。** OpenWRT 默认的 `Build/Compile` 会进包目录执行 `make`，而这个包只有文件、没有源码。加一个空的 `define Build/Compile` 即可。
+
+**配置被 samba36 的默认文件盖掉。** `samba36-server` 自己也装 `/etc/config/samba` 和 `/etc/samba/smb.conf.template`，opkg 的安装顺序不保证，装完 root 里留下的是 129 字节的默认 config。改成把配置放 `/etc/hi3520d-smb/`，由 `/etc/uci-defaults/90-hi3520d-smb` 在首启统一覆盖，不再依赖安装顺序。
+
+**镜像没重打。** 包已经装进 `root-hi3520d`，但 `root.jffs2-64k` 还是旧文件。原因是重建 `.config` 时丢了 `CONFIG_TARGET_ROOTFS_JFFS2`，`install-images` 的文件系统列表为空；同时旧 `root.jffs2-64k` 还在，规则直接判定 up-to-date。补回选项、把旧产物挪开之后才真正重建，rootfs 从 1.19MB 涨到 2.19MB。
+
+### 7.7 尚未验证的部分
+
+两口同时插盘、SMB 的实际读写速率、`force user` 与盘上既有文件属主不一致时的表现，都还没有实测数据。目前能确认的是包进了镜像、脚本和配置在 rootfs 里。
+
+---
+
+## 8 讨论
+
+### 8.1 尚未启用的能力
 
 **netfilter 关闭。** 厂商 defconfig 里 `CONFIG_NETFILTER is not set`，因此 OpenWRT 的 `firewall`、`iptables` 都不能用，设备只能做二层交换和静态路由，不能做 NAT。要用得打开 `CONFIG_NETFILTER`、`CONFIG_NF_CONNTRACK`、`CONFIG_NF_NAT`、`CONFIG_IP_NF_IPTABLES` 一整套并重编内核，再在 `DEFAULT_PACKAGES` 里补 `iptables`。这是本移植与"可用路由器固件"之间最大的一处差距。
 
@@ -244,31 +295,33 @@ sdk/                         linux-3.0.y.tgz、u-boot-2010.06.tgz（原包未改
 
 **HiMPP 未集成。** `package/mpp.tgz`、`package/drv.tgz` 里的媒体处理与 `mmz.ko` 没有并入。要用媒体功能，需要按 SDK 方式编出 ko 放进 `/lib/modules/3.0.8/`，并在启动脚本里按 SDK 参数加载 `mmz.ko`（187MB @ `0x84000000`、JPEG 5MB @ `0x8fa00000`）。这与当前 `mem=64M` 的 bootargs 是配套的。
 
-### 7.2 内存分配的取舍
+### 8.2 内存分配的取舍
 
 `mem=64M` 不是保守，是为了给 MMZ 留位置。Hi3520D 板载 256MB，SDK 默认把 `0x84000000` 起的 187MB 划给媒体内存池、`0x8fa00000` 起 5MB 给 JPEG，Linux 只拿到 64MB。本移植不启动 HiMPP，这 192MB 目前是空的。如果确定不做媒体功能，把 bootargs 改成 `mem=192M` 能显著缓解 3.0.8 内核在 64MB 下的内存压力；一旦要接 HiMPP，就得改回来。
 
-### 7.3 容量与包集
+### 8.3 容量与包集
 
 11MB 的 rootfs 分区装不下 LuCI 加一堆工具。需要更大空间可以改成 `1M + 3M + 12M`，或者裁内核（关 FB、关 USB gadget、关用不到的文件系统），把 uImage 压到 2MB 出头。包集保持最小也有原因：3.0.8 不支持现代 kmod 包的多数特性，`DEFAULT_PACKAGES` 只保留 `base-files libc libgcc busybox dropbear mtd uci opkg netifd fstools uclient-fetch logd urandom-seed urngd`；加包前得先确认它不依赖 netfilter、nftables 或 squashfs。
 
-### 7.4 `/dev/mem` 的取舍
+### 8.4 `/dev/mem` 的取舍
 
 为解决 `open_port`，`CONFIG_DEVMEM=y` 是必要的，代价是 root 能直接读写物理内存。这是嵌入式调试的常规口子，但在量产固件里应当关掉——关 `CONFIG_CRASH_DUMP` 即可，两者留一个。
 
-### 7.5 隧道能力被牺牲
+### 8.5 隧道能力被牺牲
 
 netifd 补丁把 sit/gre/vti/vxlan 等隧道类型统一返回 `-EINVAL`。以太网、静态地址、DHCP 客户端都不受影响，但确实失去了隧道能力。要恢复，得补全 3.0.8 缺失的那批 `IFLA_*` 枚举，并确认内核侧的隧道实现能对应上——工作量不小，且本板的使用场景里用不到。
 
-### 7.6 后续工作
+### 8.6 后续工作
 
 按优先级排：一是打开 netfilter 并补 `iptables`，这是让设备具备基本路由能力的前提；二是评估 squashfs 可行性，解决误操作恢复问题；三是按需集成 HiMPP；四是长时间稳定性与压力测试——目前的验证覆盖了功能，但没有跑老化。
 
 ---
 
-## 8 结论
+## 9 结论
 
-本文把 Hi3520D 接入了 OpenWRT 19.07.10 的构建体系，路线是保留厂商内核与板级驱动、替换整个用户空间，产出 16MB 整片 SPI 镜像（MD5 `05357e0daca8dca7947597e1b1ee0ee9`）。全部改动 16 处，其中 3 处固化为可复用补丁：netifd 的 3.0.8 兼容补丁、内核 uapi 头修正脚本、完整 `.config`。
+本文把 Hi3520D 接入了 OpenWRT 19.07.10 的构建体系，路线是保留厂商内核与板级驱动、替换整个用户空间，产出 16MB 整片 SPI 镜像（MD5 `23432c522bdb115ede327cc17bb9361c`）。全部改动 16 处，其中 3 处固化为可复用补丁：netifd 的 3.0.8 兼容补丁、内核 uapi 头修正脚本、完整 `.config`。
+
+功能扩展部分的代码量同样不大：一个只带脚本的本地包、两个 init 脚本、一份 SMB 模板，加上一个把 u-boot 环境焊进烧录器镜像的脚本。真正的成本在打包链上——包能编进去不等于镜像会重打，配置装到哪个路径也取决于 opkg 的安装顺序，这类问题只看代码是发现不了的。
 
 从工作量分布看，移植本身的代码量很小，绝大部分精力花在两端软件栈的年代差上：宿主工具链要迁就 2019 年的构建系统，用户空间要迁就 2010 年的内核头。这类问题的共同特征是报错位置与根因不在同一层——`open_port` 未定义看起来是内核代码问题，实际是配置；`expected identifier before 'else'` 看起来是语法错误，实际是缺宏。判断依据只能是构建日志里的真实中断位置，逐处核对，而不是照着清单改。
 
@@ -336,6 +389,32 @@ make ARCH=arm CROSS_COMPILE=/opt/hisi-linux-nptl/arm-hisiv100-linux/target/bin/a
 - `sdk/linux-3.0.y.tgz`、`sdk/u-boot-2010.06.tgz`：取自海思 `Hi3520D_SDK_V1.0.2.2` 原始压缩包，未做改动，版权归海思（HiSilicon）所有，遵循其 SDK 许可；公开再分发前请自行确认授权范围。
 - 工具链 `arm-hisiv100-linux.tar.bz2` 未入库（海思 gcc 4.4.1，i386 静态 ELF），需从原 SDK 获取。
 - OpenWRT 源码不入库，按附录 A 拉取 `v19.07.10`。
+
+## 附录 D 烧录器整片镜像
+
+`hi3520d_16m.bin` 里的 u-boot 环境区是空白的（0xFF）。用 `sf` 命令写入时这不是问题，前面已经 `saveenv` 过；但拿编程器直接写整片，u-boot 读到无效 CRC 就会退回编译进固件的默认环境，没有 `bootcmd`，上电不会自动引导。
+
+环境在 SPI 上的位置来自 `include/configs/hi3520d.h`：
+
+```c
+#define CONFIG_ENV_IS_IN_SPI_FLASH 1
+#define CONFIG_ENV_OFFSET          0x80000   /* environment starts here */
+#define CONFIG_ENV_SIZE            0x40000   /* include ENV_HEADER_SIZE */
+```
+
+即偏移 `0x80000`、长度 `0x40000`，结构是 4 字节 CRC32 加 `key=value\0` 串。这段落在 1MB boot 分区内，u-boot 二进制（226572 字节）之后，两者不重叠。
+
+`scripts/make_programmer_image.py` 按这个格式生成环境块并拼出整片镜像：
+
+```bash
+python3 make_programmer_image.py boot.bin kernel.bin rootfs.jffs2 out/
+```
+
+产出 `hi3520d_16m_programmer.bin`、`boot_env_1m.bin`、`env.bin`。写进去的变量是 `bootcmd`、`bootargs`、`mtdparts`、`bootdelay=2`、`baudrate=115200`、`ipaddr=192.168.1.200`、`serverip=192.168.1.100`、`gatewayip`、`netmask`、`bootfile`。
+
+验证过的是三件事：环境块 CRC 字段与重算值一致；`0x100000` 处字节与 `kernel.bin` 完全相同、`0x500000` 处与 `rootfs.jffs2` 完全相同；环境区之外到 boot 分区末尾、以及 `0xC0000`–`0x100000` 都是 0xFF。
+
+编程器写 16MB 的 SPI NOR（W25Q128、MX25L12845E 这类）时选整片镜像即可。旧板那颗 `MX25L6406E` 只有 8MB，装不下这个镜像。写完建议先读回比对前 1MB，u-boot 区没有备份机制，写坏了只能再拆一次芯片。
 
 ## 参考文献
 

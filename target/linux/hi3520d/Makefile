@@ -20,6 +20,7 @@ include $(INCLUDE_DIR)/target.mk
 KERNEL_MAKE_FLAGS += HOSTCFLAGS="$(HOST_CFLAGS) -Wno-error=implicit-function-declaration"
 
 # 11MB rootfs 分区内只放最小可用路由系统（LuCI 可选，见 README）
-DEFAULT_PACKAGES:=base-files libc libgcc busybox dropbear mtd uci opkg netifd fstools uclient-fetch logd urandom-seed urngd
+# samba36-server 提供 SMB；hi3520d-smb 负责 SATA 双盘挂载、账号初始化与调优模板
+DEFAULT_PACKAGES:=base-files libc libgcc busybox dropbear mtd uci opkg netifd fstools uclient-fetch logd urandom-seed urngd samba36-server hi3520d-smb
 
 $(eval $(call BuildTarget))
